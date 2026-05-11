@@ -12,7 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── CONFIG ────────────────────────────────────────────────
-const BOT_TOKEN  = '8725848636:AAGO7T0VBVSZXdHOaWexAJMsMWcYxbg170U';
+const BOT_TOKEN  = '8725848636:AAF9rTW6KtsecwpsWEoeZeM5zTya8j1Saps';
 const CHAT_ID    = '@gemtweets';
 const HANDLE     = 'GemisAlpha';
 
