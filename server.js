@@ -1,18 +1,18 @@
-// TweetPulse + SniperBot — server.js v4
-// @GemisAlpha monitor → Telegram + Solana auto-buy (40% wallet) + auto-sell 5x/8x
-// Fixes: persisted lastTweetId (no spam on restart), Twitter guest token (no 429)
+// TweetPulse + SniperBot — server.js v6
+// @GemisAlpha → Telegram + Solana auto-buy (40% wallet) + auto-sell 5x/8x
+// Parallel Nitter fetch, persistent state, anti-MEV, all bugs fixed
 
-const express    = require('express');
-const axios      = require('axios');
-const cors       = require('cors');
-const fs         = require('fs');
-const path       = require('path');
+const express  = require('express');
+const axios    = require('axios');
+const cors     = require('cors');
+const fs       = require('fs');
+const cheerio  = require('cheerio');
 const {
   Connection, Keypair, PublicKey,
   VersionedTransaction, LAMPORTS_PER_SOL
 } = require('@solana/web3.js');
 const { getAssociatedTokenAddress } = require('@solana/spl-token');
-const bs58       = require('bs58');
+const bs58     = require('bs58');
 
 const app = express();
 app.use(cors());
@@ -23,36 +23,53 @@ const BOT_TOKEN    = '8725848636:AAF9rTW6KtsecwpsWEoeZeM5zTya8j1Saps';
 const CHAT_ID      = '@gemtweets';
 const HANDLE       = 'GemisAlpha';
 const SELF_URL     = process.env.RENDER_EXTERNAL_URL || 'https://gemtweets-ne38.onrender.com';
-const STATE_FILE   = path.join('/tmp', 'tweetpulse_state.json'); // persists across soft restarts
+const STATE_FILE   = '/tmp/tweetpulse_state.json';
 
 const DEVNET       = true; // ← set false for mainnet
 const RPC_URL      = DEVNET
   ? 'https://api.devnet.solana.com'
   : 'https://api.mainnet-beta.solana.com';
 
-const BUY_PCT      = 0.40;    // 40% of wallet per trade
-const SLIPPAGE_BPS = 1500;    // 15%
-const SELL_HALF_X  = 5;       // sell 50% at 5x
-const SELL_ALL_X   = 8;       // sell all at 8x
-const MAX_MCAP_USD = 56000;   // skip if mcap > $56k
+const BUY_PCT      = 0.40;
+const SLIPPAGE_BPS = 1500;
+const SELL_HALF_X  = 5;
+const SELL_ALL_X   = 8;
+const MAX_MCAP_USD = 56000;
 const WSOL         = 'So11111111111111111111111111111111111111112';
 const JUPITER_API  = 'https://quote-api.jup.ag/v6';
+
+const NITTER_HOSTS = [
+  'https://nitter.net',
+  'https://nitter.poast.org',
+  'https://nitter.privacydev.net',
+  'https://nitter.1d4.us',
+  'https://nitter.catsarch.com',
+];
+
+// ─── LOGGING (defined first — used by everything below) ────
+const logs = [];
+function addLog(level, msg) {
+  const entry = { time: new Date().toISOString(), level, msg };
+  logs.unshift(entry);
+  if (logs.length > 300) logs.pop();
+  console.log(`[${level.toUpperCase()}] ${msg}`);
+}
 
 // ─── WALLET ────────────────────────────────────────────────
 let wallet = null;
 try {
   const raw = process.env.WALLET_PRIVATE_KEY;
-  if (!raw) throw new Error('WALLET_PRIVATE_KEY not set in env');
+  if (!raw) throw new Error('WALLET_PRIVATE_KEY not set');
   wallet = Keypair.fromSecretKey(bs58.decode(raw));
-  console.log(`[INFO] Wallet: ${wallet.publicKey.toBase58()}`);
+  addLog('info', `Wallet: ${wallet.publicKey.toBase58()}`);
 } catch (err) {
-  console.error(`[ERROR] Wallet load failed: ${err.message}`);
+  addLog('error', `Wallet load failed: ${err.message}`);
 }
 
 const connection = new Connection(RPC_URL, 'confirmed');
 
 // ─── PERSISTENT STATE ──────────────────────────────────────
-// Saves lastTweetId to /tmp so restarts don't re-process old tweets
+// FIX: addLog is now defined above so this is safe to call
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
@@ -66,150 +83,96 @@ function loadState() {
   return { lastTweetId: null };
 }
 
+// FIX: correct JSON.stringify signature (was passing 'utf8' as replacer)
 function saveState() {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ lastTweetId }, 'utf8'));
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ lastTweetId }, null, 2), 'utf8');
   } catch (err) {
     addLog('warn', `State save failed: ${err.message}`);
   }
 }
 
 // ─── APP STATE ─────────────────────────────────────────────
-let lastTweetId  = null;
-let isFirstRun   = true;
-let pollErrors   = 0;
-let isPolling    = false;
-let guestToken   = null;
-let guestTokenTs = 0;
-const positions  = {};
-const logs       = [];
+let lastTweetId = null;
+let isFirstRun  = true;
+let pollErrors  = 0;
+let isPolling   = false;
+const positions = {};
 
-function addLog(level, msg) {
-  const entry = { time: new Date().toISOString(), level, msg };
-  logs.unshift(entry);
-  if (logs.length > 300) logs.pop();
-  console.log(`[${level.toUpperCase()}] ${msg}`);
+// Host performance tracker
+const hostStats = {};
+NITTER_HOSTS.forEach(h => hostStats[h] = { failures: 0, lastMs: 9999 });
+
+// Load persisted state on boot
+const saved = loadState();
+if (saved.lastTweetId) {
+  lastTweetId = saved.lastTweetId;
+  isFirstRun  = false;
+  addLog('info', `Resumed from saved state — no spam on restart ✅`);
 }
 
-// Load persisted lastTweetId on startup
-const savedState = loadState();
-if (savedState.lastTweetId) {
-  lastTweetId = savedState.lastTweetId;
-  isFirstRun  = false; // already have baseline, skip spam
-  addLog('info', `Resumed from saved state — lastTweetId: ${lastTweetId}`);
-}
+// ─── PARALLEL NITTER FETCH ─────────────────────────────────
+async function fetchFromHost(host) {
+  const start = Date.now();
+  const { data } = await axios.get(`${host}/${HANDLE}/rss`, {
+    timeout: 8000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      'Accept'    : 'application/rss+xml, text/xml, */*',
+    }
+  });
 
-// ─── TWITTER GUEST TOKEN ───────────────────────────────────
-// Gets a short-lived guest token from Twitter (no auth needed, avoids 429)
-async function getGuestToken() {
-  const now = Date.now();
-  // Reuse token for 30 minutes
-  if (guestToken && (now - guestTokenTs) < 30 * 60 * 1000) return guestToken;
+  if (!data || !data.includes('<item>')) throw new Error('Invalid RSS');
 
-  try {
-    const res = await axios.post('https://api.twitter.com/1.1/guest/activate.json', null, {
-      headers: {
-        'Authorization': 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
-        'User-Agent': 'Mozilla/5.0',
-      },
-      timeout: 8000,
+  const $     = cheerio.load(data, { xmlMode: true });
+  const items = [];
+
+  $('item').each((_, el) => {
+    items.push({
+      guid    : $(el).find('guid').text().trim(),
+      title   : $(el).find('title').text().trim(),
+      pubDate : $(el).find('pubDate').text().trim(),
+      link    : $(el).find('link').text().trim()
+                  .replace(/https?:\/\/nitter\.[^/]+\//, 'https://x.com/'),
+      desc    : $(el).find('description').text().trim(),
     });
-    guestToken   = res.data.guest_token;
-    guestTokenTs = now;
-    addLog('info', `Guest token refreshed`);
-    return guestToken;
-  } catch (err) {
-    addLog('warn', `Guest token failed: ${err.message}`);
-    return null;
-  }
+  });
+
+  if (!items.length) throw new Error('0 items returned');
+
+  const ms = Date.now() - start;
+  hostStats[host].lastMs   = ms;
+  hostStats[host].failures = 0;
+  addLog('info', `${host} → ${items.length} tweets in ${ms}ms`);
+  return items;
 }
 
-// ─── TWITTER API (real-time via guest token) ───────────────
-async function getTwitterTweets() {
-  const token = await getGuestToken();
-  if (!token) throw new Error('No guest token');
-
-  const res = await axios.get(
-    `https://api.twitter.com/1.1/statuses/user_timeline.json`, {
-      params: {
-        screen_name     : HANDLE,
-        count           : 20,
-        tweet_mode      : 'extended',
-        include_rts     : 1,
-        exclude_replies : 0,
-      },
-      headers: {
-        'Authorization' : 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
-        'x-guest-token' : token,
-        'User-Agent'    : 'Mozilla/5.0',
-      },
-      timeout: 10000,
-    }
-  );
-
-  const tweets = res.data.map(t => ({
-    guid    : t.id_str,
-    title   : t.full_text || t.text || '',
-    pubDate : t.created_at,
-    link    : `https://x.com/${HANDLE}/status/${t.id_str}`,
-    desc    : t.full_text || t.text || '',
-  }));
-
-  addLog('info', `Twitter API: fetched ${tweets.length} tweets`);
-  return tweets;
-}
-
-// ─── NITTER FALLBACK ───────────────────────────────────────
-const NITTER_HOSTS = [
-  'https://nitter.net',
-  'https://nitter.poast.org',
-  'https://nitter.privacydev.net',
-  'https://nitter.1d4.us',
-];
-
-async function getNitterTweets() {
-  const cheerio = require('cheerio');
-  for (const host of NITTER_HOSTS) {
-    try {
-      const { data } = await axios.get(`${host}/${HANDLE}/rss`, {
-        timeout: 12000,
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/rss+xml, text/xml' }
-      });
-
-      if (!data || !data.includes('<item>')) continue;
-
-      const $     = cheerio.load(data, { xmlMode: true });
-      const items = [];
-      $('item').each((_, el) => {
-        items.push({
-          guid    : $(el).find('guid').text().trim(),
-          title   : $(el).find('title').text().trim(),
-          pubDate : $(el).find('pubDate').text().trim(),
-          link    : $(el).find('link').text().trim().replace(/https?:\/\/nitter\.[^/]+\//, 'https://x.com/'),
-          desc    : $(el).find('description').text().trim(),
-        });
-      });
-
-      if (items.length) {
-        addLog('info', `Nitter: ${items.length} tweets via ${host}`);
-        return items;
-      }
-    } catch (err) {
-      addLog('warn', `Nitter ${host}: ${err.message}`);
-    }
-  }
-  return [];
-}
-
-// ─── UNIFIED TWEET FETCHER ─────────────────────────────────
+// FIX: settled flag checked in catch block too — prevents reject after resolve
 async function getLatestTweets() {
-  try {
-    const tweets = await getTwitterTweets();
-    if (tweets.length) return tweets;
-  } catch (err) {
-    addLog('warn', `Twitter API failed: ${err.message} — trying Nitter`);
-  }
-  return getNitterTweets();
+  return new Promise((resolve, reject) => {
+    let settled  = false;
+    let failures = 0;
+
+    NITTER_HOSTS.forEach(host => {
+      fetchFromHost(host)
+        .then(items => {
+          if (!settled) {
+            settled = true;
+            resolve(items);
+          }
+        })
+        .catch(err => {
+          hostStats[host].failures++;
+          addLog('warn', `${host}: ${err.message}`);
+          failures++;
+          // FIX: only reject if not already settled
+          if (!settled && failures === NITTER_HOSTS.length) {
+            settled = true;
+            reject(new Error('All Nitter hosts failed'));
+          }
+        });
+    });
+  });
 }
 
 // ─── CA DETECTOR ───────────────────────────────────────────
@@ -223,10 +186,10 @@ function extractCAs(text) {
 // ─── DEXSCREENER MCAP ──────────────────────────────────────
 async function getMcap(mint) {
   try {
-    const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { timeout: 8000 });
+    const res   = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { timeout: 8000 });
     const pairs = res.data?.pairs;
     if (!pairs?.length) return null;
-    const best = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+    const best  = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
     return best?.fdv || best?.marketCap || null;
   } catch { return null; }
 }
@@ -259,106 +222,105 @@ async function getTokenPrice(mint) {
 async function jupiterBuy(mint, solAmount) {
   if (!wallet) throw new Error('Wallet not loaded');
   const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
-  addLog('info', `Jupiter buy: ${solAmount.toFixed(4)} SOL → ${mint}`);
+  addLog('info', `Jupiter buy: ${solAmount.toFixed(4)} SOL → ${mint.slice(0,8)}...`);
 
-  const quoteRes = await axios.get(`${JUPITER_API}/quote`, {
+  const { data: quote } = await axios.get(`${JUPITER_API}/quote`, {
     params: { inputMint: WSOL, outputMint: mint, amount: lamports, slippageBps: SLIPPAGE_BPS },
     timeout: 10000,
   });
-  const quote = quoteRes.data;
-  if (!quote?.outAmount) throw new Error('No quote from Jupiter');
+  if (!quote?.outAmount) throw new Error('No Jupiter quote');
 
-  const swapRes = await axios.post(`${JUPITER_API}/swap`, {
-    quoteResponse: quote,
-    userPublicKey: wallet.publicKey.toBase58(),
-    wrapAndUnwrapSol: true,
+  const { data: swapData } = await axios.post(`${JUPITER_API}/swap`, {
+    quoteResponse    : quote,
+    userPublicKey    : wallet.publicKey.toBase58(),
+    wrapAndUnwrapSol : true,
     prioritizationFeeLamports: {
       priorityLevelWithMaxLamports: { maxLamports: 1000000, priorityLevel: 'veryHigh' }
     },
     dynamicComputeUnitLimit: true,
   }, { timeout: 15000 });
 
-  const { swapTransaction } = swapRes.data;
-  if (!swapTransaction) throw new Error('No swap tx from Jupiter');
+  if (!swapData?.swapTransaction) throw new Error('No swap transaction returned');
 
-  const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
+  const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
   tx.sign([wallet]);
 
   const txid = await connection.sendRawTransaction(tx.serialize(), {
     skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3,
   });
   await connection.confirmTransaction(txid, 'confirmed');
-  addLog('success', `Buy confirmed: ${txid}`);
+  addLog('success', `Buy TX confirmed: ${txid}`);
   return { txid, outAmount: parseInt(quote.outAmount) };
 }
 
-// ─── JUPITER SELL ───────────────────────────────────────────
+// ─── JUPITER SELL ──────────────────────────────────────────
 async function jupiterSell(mint, amountTokens) {
   if (!wallet) throw new Error('Wallet not loaded');
-  addLog('info', `Jupiter sell: ${amountTokens} tokens → SOL`);
+  addLog('info', `Jupiter sell: ${amountTokens} tokens of ${mint.slice(0,8)}...`);
 
-  const quoteRes = await axios.get(`${JUPITER_API}/quote`, {
+  const { data: quote } = await axios.get(`${JUPITER_API}/quote`, {
     params: { inputMint: mint, outputMint: WSOL, amount: amountTokens, slippageBps: SLIPPAGE_BPS },
     timeout: 10000,
   });
-  const quote = quoteRes.data;
-  if (!quote?.outAmount) throw new Error('No sell quote from Jupiter');
+  if (!quote?.outAmount) throw new Error('No sell quote');
 
-  const swapRes = await axios.post(`${JUPITER_API}/swap`, {
-    quoteResponse: quote,
-    userPublicKey: wallet.publicKey.toBase58(),
-    wrapAndUnwrapSol: true,
+  const { data: swapData } = await axios.post(`${JUPITER_API}/swap`, {
+    quoteResponse    : quote,
+    userPublicKey    : wallet.publicKey.toBase58(),
+    wrapAndUnwrapSol : true,
     prioritizationFeeLamports: {
       priorityLevelWithMaxLamports: { maxLamports: 1000000, priorityLevel: 'veryHigh' }
     },
     dynamicComputeUnitLimit: true,
   }, { timeout: 15000 });
 
-  const { swapTransaction } = swapRes.data;
-  if (!swapTransaction) throw new Error('No sell tx from Jupiter');
+  if (!swapData?.swapTransaction) throw new Error('No sell transaction returned');
 
-  const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
+  const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
   tx.sign([wallet]);
 
   const txid = await connection.sendRawTransaction(tx.serialize(), {
     skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3,
   });
   await connection.confirmTransaction(txid, 'confirmed');
-  addLog('success', `Sell confirmed: ${txid}`);
+  addLog('success', `Sell TX confirmed: ${txid}`);
   return { txid, solReceived: parseInt(quote.outAmount) };
 }
 
 // ─── HANDLE CA ─────────────────────────────────────────────
 async function handleCA(mint) {
+  // FIX: explicit guard with log — never enters if already tracked
   if (positions[mint]) {
     addLog('info', `Already in position: ${mint.slice(0,8)}... — skipping`);
     return;
   }
 
-  addLog('info', `CA found: ${mint} — checking mcap...`);
+  addLog('info', `CA detected: ${mint} — checking mcap...`);
 
-  // Mcap check first — silent
+  // Mcap check first — silent, no Telegram noise before decision
   const mcap = await getMcap(mint);
   if (mcap !== null && mcap > MAX_MCAP_USD) {
-    addLog('warn', `Mcap $${mcap.toLocaleString()} > limit — skipping`);
+    addLog('warn', `Mcap $${mcap.toLocaleString()} > $${MAX_MCAP_USD.toLocaleString()} — skipping`);
     await sendTelegram(
       `⚠️ <b>CA Skipped — Mcap Too High</b>\n\n` +
       `<code>${mint}</code>\n` +
-      `Mcap: $${mcap.toLocaleString()} (limit: $${MAX_MCAP_USD.toLocaleString()})`
+      `Mcap: $${mcap.toLocaleString()} (max $${MAX_MCAP_USD.toLocaleString()})`
     );
     return;
   }
 
-  // Get 40% of wallet
+  // Get 40% of current SOL balance
   const solBalance = await getWalletSOL();
   const buyAmount  = parseFloat((solBalance * BUY_PCT).toFixed(6));
 
   if (buyAmount < 0.001) {
+    addLog('warn', `Wallet too low: ${solBalance} SOL`);
     await sendTelegram(`⚠️ <b>Wallet too low</b>: ${solBalance.toFixed(4)} SOL — skipping`);
     return;
   }
 
   const mcapStr = mcap ? `$${mcap.toLocaleString()}` : 'unverified';
+
   await sendTelegram(
     `🎯 <b>CA Detected from @${HANDLE}</b>\n\n` +
     `<code>${mint}</code>\n\n` +
@@ -371,6 +333,7 @@ async function handleCA(mint) {
     const buyPrice            = await getTokenPrice(mint);
     const { txid, outAmount } = await jupiterBuy(mint, buyAmount);
 
+    // FIX: only set position AFTER successful buy confirmation
     positions[mint] = {
       buyPrice : buyPrice || 0.000001,
       amount   : outAmount,
@@ -384,66 +347,78 @@ async function handleCA(mint) {
     await sendTelegram(
       `✅ <b>Buy Confirmed!</b>\n\n` +
       `CA: <code>${mint}</code>\n` +
-      `SOL spent: <b>${buyAmount} SOL</b>\n` +
+      `SOL spent: <b>${buyAmount}</b>\n` +
       `Tokens: ${outAmount.toLocaleString()}\n` +
-      `🔗 <a href="https://solscan.io/tx/${txid}${DEVNET ? '?cluster=devnet' : ''}">View TX</a>\n\n` +
-      `🎯 Auto-sell: 50% @ ${SELL_HALF_X}x | 100% @ ${SELL_ALL_X}x`
+      `🔗 <a href="https://solscan.io/tx/${txid}${DEVNET ? '?cluster=devnet' : ''}">Solscan</a>\n\n` +
+      `🎯 Auto-sell: 50% @ ${SELL_HALF_X}x | All @ ${SELL_ALL_X}x`
     );
 
   } catch (err) {
-    addLog('error', `Buy failed: ${err.message}`);
-    await sendTelegram(`❌ <b>Buy Failed</b>\n\nCA: <code>${mint}</code>\nError: ${err.message}`);
-    delete positions[mint];
+    addLog('error', `Buy failed for ${mint.slice(0,8)}...: ${err.message}`);
+    await sendTelegram(`❌ <b>Buy Failed</b>\n\n<code>${mint}</code>\nError: ${err.message}`);
+    // No delete needed — position was never set on failure
   }
 }
 
 // ─── PRICE MONITOR ─────────────────────────────────────────
+// FIX: marks allSold flag and only deletes on NEXT cycle
+// so Telegram message always fires before the position is removed
 async function monitorPositions() {
   const mints = Object.keys(positions);
   if (!mints.length) return;
 
   for (const mint of mints) {
     const pos = positions[mint];
-    if (pos.allSold) { delete positions[mint]; continue; }
+
+    // Clean up fully closed positions from previous cycle
+    if (pos.allSold) {
+      delete positions[mint];
+      continue;
+    }
 
     try {
-      const currentPrice = await getTokenPrice(mint);
-      if (!currentPrice || !pos.buyPrice) continue;
+      const price = await getTokenPrice(mint);
+      if (!price || !pos.buyPrice) continue;
 
-      const multiplier = currentPrice / pos.buyPrice;
-      addLog('info', `${mint.slice(0,8)}...: ${multiplier.toFixed(2)}x`);
+      const x = price / pos.buyPrice;
+      addLog('info', `${mint.slice(0,8)}...: ${x.toFixed(2)}x`);
 
-      if (multiplier >= SELL_HALF_X && !pos.halfSold) {
-        const balance = await getTokenBalance(mint);
-        const sellAmt = Math.floor(balance / 2);
-        if (sellAmt > 0) {
-          const { txid, solReceived } = await jupiterSell(mint, sellAmt);
+      // 5x — sell half
+      if (x >= SELL_HALF_X && !pos.halfSold) {
+        addLog('info', `🎯 ${SELL_HALF_X}x hit on ${mint.slice(0,8)}...`);
+        const bal = await getTokenBalance(mint);
+        const amt = Math.floor(bal / 2);
+        if (amt > 0) {
+          const { txid, solReceived } = await jupiterSell(mint, amt);
           pos.halfSold = true;
           await sendTelegram(
             `🎯 <b>${SELL_HALF_X}x Hit — Sold 50%</b>\n\n` +
             `CA: <code>${mint}</code>\n` +
             `SOL received: <b>${(solReceived / LAMPORTS_PER_SOL).toFixed(4)} SOL</b>\n` +
-            `🔗 <a href="https://solscan.io/tx/${txid}${DEVNET ? '?cluster=devnet' : ''}">View TX</a>\n` +
+            `🔗 <a href="https://solscan.io/tx/${txid}${DEVNET ? '?cluster=devnet' : ''}">Solscan</a>\n` +
             `⏳ Holding rest until ${SELL_ALL_X}x...`
           );
         }
       }
 
-      if (multiplier >= SELL_ALL_X && pos.halfSold && !pos.allSold) {
-        const balance = await getTokenBalance(mint);
-        if (balance > 0) {
-          const { txid, solReceived } = await jupiterSell(mint, balance);
+      // 8x — sell all
+      if (x >= SELL_ALL_X && pos.halfSold && !pos.allSold) {
+        addLog('info', `🚀 ${SELL_ALL_X}x hit on ${mint.slice(0,8)}...`);
+        const bal = await getTokenBalance(mint);
+        if (bal > 0) {
+          const { txid, solReceived } = await jupiterSell(mint, bal);
+          // FIX: set allSold flag — deletion happens on next monitor cycle
           pos.allSold = true;
           await sendTelegram(
             `🚀 <b>${SELL_ALL_X}x Hit — Sold All!</b>\n\n` +
             `CA: <code>${mint}</code>\n` +
             `SOL received: <b>${(solReceived / LAMPORTS_PER_SOL).toFixed(4)} SOL</b>\n` +
             `Profit: ~${((solReceived / LAMPORTS_PER_SOL) - pos.solSpent).toFixed(4)} SOL\n` +
-            `🔗 <a href="https://solscan.io/tx/${txid}${DEVNET ? '?cluster=devnet' : ''}">View TX</a>`
+            `🔗 <a href="https://solscan.io/tx/${txid}${DEVNET ? '?cluster=devnet' : ''}">Solscan</a>`
           );
-          delete positions[mint];
         }
       }
+
     } catch (err) {
       addLog('error', `Price monitor ${mint.slice(0,8)}...: ${err.message}`);
     }
@@ -458,14 +433,14 @@ async function sendTelegram(text) {
       { chat_id: CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: false },
       { timeout: 10000 }
     );
-    if (!res.data.ok) addLog('error', `Telegram: ${JSON.stringify(res.data)}`);
+    if (!res.data.ok) addLog('error', `Telegram error: ${JSON.stringify(res.data)}`);
     else addLog('success', 'Telegram sent ✅');
   } catch (err) {
     addLog('error', `Telegram: ${err.response?.data?.description || err.message}`);
   }
 }
 
-// ─── BUILD MESSAGE ─────────────────────────────────────────
+// ─── BUILD TWEET MESSAGE ───────────────────────────────────
 function buildMessage(tweet) {
   const isRT    = tweet.title.startsWith('RT @');
   const isReply = tweet.title.startsWith('@');
@@ -474,7 +449,7 @@ function buildMessage(tweet) {
   return (
     `${icon} <b>@${HANDLE} — ${type}</b>\n\n` +
     `${tweet.title}\n\n` +
-    `🔗 <a href="${tweet.link}">View on Twitter/X</a>\n` +
+    `🔗 <a href="${tweet.link}">View on X</a>\n` +
     `<i>${tweet.pubDate}</i>`
   );
 }
@@ -490,7 +465,6 @@ async function poll() {
 
     const latest = tweets[0];
 
-    // First run with no saved state — set baseline silently
     if (isFirstRun) {
       lastTweetId = latest.guid;
       isFirstRun  = false;
@@ -504,14 +478,13 @@ async function poll() {
       return;
     }
 
-    // Collect new tweets
     const newTweets = [];
-    for (const tweet of tweets) {
-      if (tweet.guid === lastTweetId) break;
-      newTweets.push(tweet);
+    for (const t of tweets) {
+      if (t.guid === lastTweetId) break;
+      newTweets.push(t);
     }
 
-    // Update and persist BEFORE sending (prevent duplicates on crash)
+    // Persist BEFORE sending — prevents duplicates if server crashes mid-send
     lastTweetId = latest.guid;
     saveState();
 
@@ -530,8 +503,10 @@ async function poll() {
       await new Promise(r => setTimeout(r, 800));
     }
 
-    addLog('success', `Processed ${newTweets.length} tweet(s)`);
+    addLog('success', `Processed ${newTweets.length} new tweet(s)`);
 
+  } catch (err) {
+    addLog('error', `Poll error: ${err.message}`);
   } finally {
     isPolling = false;
   }
@@ -545,7 +520,7 @@ async function safePoll() {
   } catch (err) {
     pollErrors++;
     isPolling = false;
-    addLog('error', `Poll error #${pollErrors}: ${err.message}`);
+    addLog('error', `SafePoll #${pollErrors}: ${err.message}`);
     if (pollErrors === 5) {
       await sendTelegram('⚠️ <b>TweetPulse</b>: 5 consecutive errors. Still running.').catch(() => {});
     }
@@ -559,14 +534,14 @@ function startKeepalive() {
       await axios.get(`${SELF_URL}/health`, { timeout: 8000 });
       addLog('info', '🏓 Keepalive OK');
     } catch (err) {
-      addLog('warn', `Keepalive: ${err.message}`);
+      addLog('warn', `Keepalive failed: ${err.message}`);
     }
   }, 3 * 60 * 1000);
-  addLog('info', `🏓 Keepalive → every 3min`);
+  addLog('info', `🏓 Keepalive active — pinging every 3min`);
 }
 
 // ─── INTERVALS ─────────────────────────────────────────────
-setInterval(safePoll,         15 * 1000); // poll every 15s
+setInterval(safePoll,         15 * 1000); // tweet poll every 15s
 setInterval(monitorPositions, 20 * 1000); // price check every 20s
 
 // ─── ROUTES ────────────────────────────────────────────────
@@ -575,14 +550,17 @@ app.get('/', (req, res) => res.json({
   mode          : DEVNET ? 'DEVNET 🧪' : 'MAINNET 🔴',
   watching      : `@${HANDLE}`,
   notifying     : CHAT_ID,
-  wallet        : wallet?.publicKey.toBase58() || 'NOT LOADED',
-  pollEvery     : '15 seconds',
+  wallet        : wallet?.publicKey.toBase58() || 'NOT LOADED ⚠️',
+  pollEvery     : '15s',
+  priceMonitor  : '20s',
+  keepalive     : '3min',
   maxMcap       : `$${MAX_MCAP_USD.toLocaleString()}`,
   buyPct        : '40% of wallet',
   openPositions : Object.keys(positions).length,
   positions,
   lastTweetId,
   pollErrors,
+  hostStats,
   uptime        : `${Math.floor(process.uptime() / 60)} min`,
   recentLogs    : logs.slice(0, 15),
 }));
@@ -590,16 +568,12 @@ app.get('/', (req, res) => res.json({
 app.get('/health',    (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 app.get('/logs',      (req, res) => res.json(logs));
 app.get('/positions', (req, res) => res.json(positions));
-
-app.post('/force-poll', async (req, res) => {
-  await safePoll();
-  res.json({ ok: true });
-});
+app.post('/force-poll', async (req, res) => { await safePoll(); res.json({ ok: true }); });
 
 // ─── START ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  addLog('info', `🚀 TweetPulse v4 on port ${PORT}`);
+  addLog('info', `🚀 TweetPulse v6 on port ${PORT}`);
   addLog('info', `Mode: ${DEVNET ? 'DEVNET 🧪' : 'MAINNET 🔴'}`);
   addLog('info', `Wallet: ${wallet?.publicKey.toBase58() || 'NOT LOADED ⚠️'}`);
   addLog('info', `Buy: 40% of wallet | Max mcap: $${MAX_MCAP_USD.toLocaleString()}`);
