@@ -1,7 +1,7 @@
 {
-  "name": "tweetpulse",
-  "version": "1.0.0",
-  "description": "Twitter → Telegram notifier for @GemisAlpha",
+  "name": "tweetpulse-sniper",
+  "version": "3.0.0",
+  "description": "Twitter monitor + Solana auto-buy/sell for @GemisAlpha",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -13,7 +13,9 @@
     "express": "^4.18.2",
     "axios": "^1.6.0",
     "cheerio": "^1.0.0",
-    "node-cron": "^3.0.3",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "@solana/web3.js": "^1.91.1",
+    "@solana/spl-token": "^0.4.6",
+    "bs58": "^4.0.1"
   }
 }
