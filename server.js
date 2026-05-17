@@ -36,7 +36,7 @@ const SELL_HALF_X  = 5;
 const SELL_ALL_X   = 8;
 const MAX_MCAP_USD = 56000;
 const WSOL         = 'So11111111111111111111111111111111111111112';
-const JUPITER_API  = 'https://quote-api.jup.ag/v6';
+const JUPITER_API  = 'https://lite-api.jup.ag/swap/v1/quote';
 
 const NITTER_HOSTS = [
   'https://nitter.net',
