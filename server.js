@@ -1,5 +1,5 @@
 // TweetPulse + SniperBot — server.js v6
-// @GemisAlpha → Telegram + Solana auto-buy (40% wallet) + auto-sell 5x/8x
+// @Macryptia → Telegram + Solana auto-buy (40% wallet) + auto-sell 5x/8x
 // Parallel Nitter fetch, persistent state, anti-MEV, all bugs fixed
 
 const express  = require('express');
@@ -21,7 +21,7 @@ app.use(express.json());
 // ─── CONFIG ────────────────────────────────────────────────
 const BOT_TOKEN    = '8725848636:AAF9rTW6KtsecwpsWEoeZeM5zTya8j1Saps';
 const CHAT_ID      = '@gemtweets';
-const HANDLE       = 'GemisAlpha';
+const HANDLE       = 'Macryptia';
 const SELF_URL     = process.env.RENDER_EXTERNAL_URL || 'https://gemtweets-ne38.onrender.com';
 const STATE_FILE   = '/tmp/tweetpulse_state.json';
 
