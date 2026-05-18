@@ -38,7 +38,7 @@ const HANDLES = [
 // 3. Add it as TWITTER_AUTH_TOKEN in Render env vars
 const TWITTER_AUTH_TOKEN = process.env.TWITTER_AUTH_TOKEN || '';
 
-const DEVNET       = true; // ← set false for mainnet
+const DEVNET       = false; // switched to mainnet — devnet breaks Jupiter ALTs
 const RPC_URL      = DEVNET
   ? 'https://api.devnet.solana.com'
   : 'https://api.mainnet-beta.solana.com';
@@ -54,7 +54,16 @@ const WSOL         = 'So11111111111111111111111111111111111111112';
 const JUPITER_SWAP_API  = 'https://api.jup.ag/swap/v1';
 const JUPITER_PRICE_API = 'https://api.jup.ag/price/v3';
 
-// Nitter fallback pool
+// ── RSS SOURCES ────────────────────────────────────────────
+// RSSHub is the PRIMARY source — proxies Twitter in near real-time (~30-60s)
+// No auth needed, no cache delay like Nitter RSS (which delays 5-10 min)
+const RSSHUB_HOSTS = [
+  'https://rsshub.app',           // official public instance
+  'https://rss.shab.fun',         // community mirror
+  'https://rsshub.rssforever.com',// community mirror
+];
+
+// Nitter is SECONDARY fallback only — has 5-10min RSS cache
 const NITTER_HOSTS = [
   'https://nitter.net',
   'https://nitter.poast.org',
@@ -138,7 +147,7 @@ const positions    = {};
 
 // ─── HOST STATS ────────────────────────────────────────────
 const hostStats = {};
-NITTER_HOSTS.forEach(h => hostStats[h] = { failures: 0, lastMs: 9999 });
+[...RSSHUB_HOSTS, ...NITTER_HOSTS].forEach(h => hostStats[h] = { failures: 0, lastMs: 9999 });
 
 // ─── TWITTER GRAPHQL (PRIMARY — real-time) ─────────────────
 // Uses Twitter's internal API with your browser auth_token cookie
@@ -272,59 +281,66 @@ async function getTwitterTweets(handle) {
   return tweets;
 }
 
-// ─── NITTER FALLBACK ───────────────────────────────────────
-async function fetchFromHost(host, handle) {
-  const start = Date.now();
-  const { data } = await axios.get(`${host}/${handle}/rss`, {
-    timeout: 8000,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-      'Accept'    : 'application/rss+xml, text/xml, */*',
-    }
-  });
 
-  if (!data || !data.includes('<item>')) throw new Error('Invalid RSS');
 
+// ─── RSS PARSER (shared by RSSHub and Nitter) ──────────────
+function parseRSS(data, handle, host) {
+  if (!data || !data.includes('<item>')) throw new Error('No <item> in RSS');
   const $     = cheerio.load(data, { xmlMode: true });
   const items = [];
-
   $('item').each((_, el) => {
+    const rawLink = $(el).find('link').text().trim();
     items.push({
-      guid    : $(el).find('guid').text().trim(),
+      guid    : $(el).find('guid').text().trim() || rawLink,
       title   : $(el).find('title').text().trim(),
       pubDate : $(el).find('pubDate').text().trim(),
-      link    : $(el).find('link').text().trim()
-                  .replace(/https?:\/\/nitter\.[^/]+\//, 'https://x.com/'),
+      link    : rawLink.replace(/https?:\/\/(nitter|rsshub)[^/]*\//, 'https://x.com/'),
       desc    : $(el).find('description').text().trim(),
     });
   });
-
-  if (!items.length) throw new Error('0 items returned');
-
-  const ms = Date.now() - start;
-  hostStats[host].lastMs   = ms;
-  hostStats[host].failures = 0;
-  addLog('info', `[${handle}] Nitter ${host} → ${items.length} tweets in ${ms}ms`);
+  if (!items.length) throw new Error('0 items parsed');
   return items;
 }
 
-async function getNitterTweets(handle) {
+// ─── FETCH FROM A SINGLE HOST ──────────────────────────────
+async function fetchRSSFromHost(url, handle, host) {
+  const start = Date.now();
+  const { data } = await axios.get(url, {
+    timeout: 8000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      'Accept'    : 'application/rss+xml, application/xml, text/xml, */*',
+    }
+  });
+  const items = parseRSS(data, handle, host);
+  const ms    = Date.now() - start;
+  hostStats[host].lastMs   = ms;
+  hostStats[host].failures = 0;
+  addLog('info', `[${handle}] ${host} → ${items.length} tweets in ${ms}ms`);
+  return items;
+}
+
+// ─── RACE ALL HOSTS IN PARALLEL ────────────────────────────
+// Fires all hosts at once — whichever responds first wins
+// This gives minimum possible latency
+function raceHosts(urls, handle) {
   return new Promise((resolve, reject) => {
     let settled  = false;
     let failures = 0;
+    const total  = urls.length;
 
-    NITTER_HOSTS.forEach(host => {
-      fetchFromHost(host, handle)
+    urls.forEach(({ url, host }) => {
+      fetchRSSFromHost(url, handle, host)
         .then(items => {
           if (!settled) { settled = true; resolve(items); }
         })
         .catch(err => {
-          hostStats[host].failures++;
-          addLog('warn', `[${handle}] Nitter ${host}: ${err.message}`);
+          if (hostStats[host]) hostStats[host].failures++;
+          addLog('warn', `[${handle}] ${host}: ${err.message}`);
           failures++;
-          if (!settled && failures === NITTER_HOSTS.length) {
+          if (!settled && failures === total) {
             settled = true;
-            reject(new Error(`All Nitter hosts failed for @${handle}`));
+            reject(new Error(`All RSS hosts failed for @${handle}`));
           }
         });
     });
@@ -332,21 +348,40 @@ async function getNitterTweets(handle) {
 }
 
 // ─── UNIFIED TWEET FETCHER ─────────────────────────────────
-// Twitter GraphQL first (real-time), Nitter as fallback
+// 1. Twitter GraphQL (if TWITTER_AUTH_TOKEN set) — ~5s delay
+// 2. RSSHub parallel race (PRIMARY no-auth source) — ~30-60s delay
+// 3. Nitter parallel race (FALLBACK) — ~5-10min delay (last resort)
 async function getLatestTweets(handle) {
-  // Only use GraphQL if auth token is configured
+  // Layer 1: GraphQL (fastest, requires auth token in Render env vars)
   if (TWITTER_AUTH_TOKEN) {
     try {
       const tweets = await getTwitterTweets(handle);
       if (tweets.length) return tweets;
-      addLog('warn', `[${handle}] GraphQL returned 0 tweets — trying Nitter`);
+      addLog('warn', `[${handle}] GraphQL returned 0 — falling to RSSHub`);
     } catch (err) {
-      addLog('warn', `[${handle}] GraphQL failed: ${err.message} — trying Nitter`);
+      addLog('warn', `[${handle}] GraphQL failed: ${err.message} — falling to RSSHub`);
     }
-  } else {
-    addLog('warn', `[${handle}] No TWITTER_AUTH_TOKEN set — using Nitter (slower)`);
   }
-  return getNitterTweets(handle);
+
+  // Layer 2: RSSHub — near real-time, no auth needed
+  try {
+    const rsshubUrls = RSSHUB_HOSTS.map(h => ({
+      host: h,
+      url : `${h}/twitter/user/${handle}`,
+    }));
+    const tweets = await raceHosts(rsshubUrls, handle);
+    if (tweets.length) return tweets;
+  } catch (err) {
+    addLog('warn', `[${handle}] RSSHub all failed: ${err.message} — falling to Nitter`);
+  }
+
+  // Layer 3: Nitter — last resort, has 5-10min RSS cache
+  addLog('warn', `[${handle}] Using Nitter fallback (slow)`);
+  const nitterUrls = NITTER_HOSTS.map(h => ({
+    host: h,
+    url : `${h}/${handle}/rss`,
+  }));
+  return raceHosts(nitterUrls, handle);
 }
 
 // ─── CA DETECTOR ───────────────────────────────────────────
@@ -400,13 +435,33 @@ async function getTokenPrice(mint) {
   } catch { return 0; }
 }
 
+// ─── AXIOS WITH RETRY (handles 429 rate limits) ────────────
+async function axiosWithRetry(config, retries = 3, delayMs = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await axios(config);
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 429 && i < retries - 1) {
+        const wait = delayMs * Math.pow(2, i); // exponential backoff: 1s, 2s, 4s
+        addLog('warn', `Jupiter 429 — retrying in ${wait}ms (attempt ${i + 1}/${retries})`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ─── JUPITER BUY ───────────────────────────────────────────
 async function jupiterBuy(mint, solAmount) {
   if (!wallet) throw new Error('Wallet not loaded');
   const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
   addLog('info', `Jupiter buy: ${solAmount.toFixed(4)} SOL → ${mint.slice(0,8)}...`);
 
-  const { data: quote } = await axios.get(`${JUPITER_SWAP_API}/quote`, {
+  const { data: quote } = await axiosWithRetry({
+    method : 'get',
+    url    : `${JUPITER_SWAP_API}/quote`,
     params : {
       inputMint  : WSOL,
       outputMint : mint,
@@ -417,26 +472,31 @@ async function jupiterBuy(mint, solAmount) {
   });
   if (!quote?.outAmount) throw new Error('No Jupiter quote returned');
 
-  const { data: swapData } = await axios.post(`${JUPITER_SWAP_API}/swap`, {
-    quoteResponse           : quote,
-    userPublicKey           : wallet.publicKey.toBase58(),
-    wrapAndUnwrapSol        : true,
-    dynamicComputeUnitLimit : true,
-    // Anti-MEV: Jito tip (new format — old priorityLevelWithMaxLamports removed)
-    prioritizationFeeLamports: {
-      jitoTipLamports: 100000, // 0.0001 SOL
+  const { data: swapData } = await axiosWithRetry({
+    method : 'post',
+    url    : `${JUPITER_SWAP_API}/swap`,
+    data   : {
+      quoteResponse           : quote,
+      userPublicKey           : wallet.publicKey.toBase58(),
+      wrapAndUnwrapSol        : true,
+      dynamicComputeUnitLimit : true,
+      prioritizationFeeLamports: {
+        jitoTipLamports: 100000, // 0.0001 SOL Jito tip — anti-MEV
+      },
     },
-  }, { timeout: 15000 });
+    timeout: 15000,
+  });
 
   if (!swapData?.swapTransaction) throw new Error('No swap transaction returned');
 
   const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
   tx.sign([wallet]);
 
+  // skipPreflight: true — avoids ALT simulation issues on some RPC nodes
   const txid = await connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight       : false,
+    skipPreflight       : true,
     preflightCommitment : 'confirmed',
-    maxRetries          : 3,
+    maxRetries          : 5,
   });
   await connection.confirmTransaction(txid, 'confirmed');
   addLog('success', `Buy TX confirmed: ${txid}`);
@@ -754,7 +814,7 @@ function startKeepalive() {
 }
 
 // ─── INTERVALS ─────────────────────────────────────────────
-setInterval(pollAll,          15 * 1000); // all handles every 15s
+setInterval(pollAll,          10 * 1000); // all handles every 10s
 setInterval(monitorPositions, 20 * 1000); // price check every 20s
 
 // ─── ROUTES ────────────────────────────────────────────────
@@ -764,8 +824,8 @@ app.get('/', (req, res) => res.json({
   watching       : HANDLES.map(h => `@${h}`),
   notifying      : CHAT_ID,
   wallet         : wallet?.publicKey.toBase58() || 'NOT LOADED ⚠️',
-  twitterSource  : TWITTER_AUTH_TOKEN ? 'GraphQL API (real-time) ✅' : 'Nitter RSS (slow) ⚠️ — set TWITTER_AUTH_TOKEN',
-  pollEvery      : '15s per handle',
+  twitterSource  : TWITTER_AUTH_TOKEN ? 'GraphQL API ✅ (fastest)' : 'RSSHub → Nitter fallback',
+  pollEvery      : '10s per handle',
   priceMonitor   : '20s',
   keepalive      : '3min',
   maxMcap        : `$${MAX_MCAP_USD.toLocaleString()}`,
@@ -802,7 +862,8 @@ app.listen(PORT, () => {
   addLog('info', `Mode: ${DEVNET ? 'DEVNET 🧪' : 'MAINNET 🔴'}`);
   addLog('info', `Wallet: ${wallet?.publicKey.toBase58() || 'NOT LOADED ⚠️'}`);
   addLog('info', `Watching: ${HANDLES.map(h => '@' + h).join(', ')}`);
-  addLog('info', `Twitter source: ${TWITTER_AUTH_TOKEN ? 'GraphQL (real-time)' : 'Nitter RSS (set TWITTER_AUTH_TOKEN for speed)'}`);
+  addLog('info', `Tweet source: ${TWITTER_AUTH_TOKEN ? 'GraphQL (fastest)' : 'RSSHub primary → Nitter fallback'}`);
+  addLog('info', `Poll: every 10s | Price monitor: every 20s`);
   setTimeout(pollAll,        5000);
   setTimeout(startKeepalive, 15000);
 });
